@@ -1,6 +1,8 @@
-"""关键功能自测：补录、并发构建、单轮复用、重复键失败与重试、取消、重启接续。"""
+"""关键功能自测：补录、并发构建、单轮复用、重复键失败与重试、取消、重启接续、
+取消×失败收尾的可控交错（两种顺序）。"""
 from __future__ import annotations
 
+import threading
 import time
 
 import psycopg
@@ -296,3 +298,179 @@ def test_start_build_when_index_already_valid_reports_complete(client):
     assert resp.status_code == 200
     assert resp.json()["status"] == "complete"
     assert resp.json()["index_valid"] is True
+
+
+# --------------------- 取消 × 失败收尾：可控交错 ---------------------
+
+
+class _Interleave:
+    """可控交错控制器：用事件把关键路径挂起，测试主线程按确定时序推进。"""
+
+    def __init__(self) -> None:
+        self.failure_entered = threading.Event()
+        self.failure_release = threading.Event()
+        self.cancel_entered = threading.Event()
+        self.cancel_release = threading.Event()
+
+    def before_failure_finalize(self, _round_id: str) -> None:
+        self.failure_entered.set()
+        self.failure_release.wait(timeout=30)
+
+    def before_cancel_mark(self, _round_id: str) -> None:
+        self.cancel_entered.set()
+        self.cancel_release.wait(timeout=30)
+
+
+def _insert_duplicate_keys() -> None:
+    with dbmod.pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO reports(lab_no,report_no,measured) VALUES "
+            "('DUP','K',1),('DUP','K',2)"
+        )
+        conn.commit()
+
+
+def _dedupe() -> None:
+    with dbmod.pool().connection() as conn:
+        conn.execute("""
+            DELETE FROM reports r USING (
+              SELECT id, row_number() OVER (PARTITION BY lab_no, report_no ORDER BY id) rn
+              FROM reports) d WHERE r.id=d.id AND d.rn>1""")
+        conn.commit()
+
+
+def test_cancel_first_then_late_failure_finalize_keeps_cancelled(client):
+    """可控交错顺序一：取消先受理，失败收尾迟到。
+
+    时序：构建因重复键失败 -> 失败收尾被钩子挂起 -> 取消受理(202) ->
+    watcher 核实该轮 SQL 已停止且索引无效 -> cancelled 并清理残留 ->
+    放行迟到的失败收尾 -> 终态保持 cancelled 不被覆写。
+    交错期间补录与状态查询仍可用；去重后可重建。
+    """
+    _insert_duplicate_keys()
+    ctl = _Interleave()
+    service.hooks.before_failure_finalize = ctl.before_failure_finalize
+    try:
+        r = client.post("/index/build")
+        assert r.status_code == 202
+        round_id = r.json()["round_id"]
+        # 构建线程已进入失败收尾（被钩子挂起，尚未落库）
+        assert ctl.failure_entered.wait(timeout=15)
+
+        # 交错期间：补录与状态查询仍可用
+        assert client.post("/reports", json={
+            "lab_no": "OK", "report_no": "1", "measured": 1}).status_code == 201
+        mid = client.get("/index/status")
+        assert mid.status_code == 200
+        assert mid.json()["status"] == "running" and mid.json()["round_id"] == round_id
+
+        # 取消先受理：202 cancel_requested
+        ack = client.post("/index/cancel")
+        assert ack.status_code == 202
+        assert ack.json()["status"] == "cancel_requested"
+        assert ack.json()["cancel_accepted"] is True
+
+        # watcher 核实后端 SQL 已停止且索引无效 -> cancelled，并清理无效残留
+        final = poll_status(client, "cancelled", timeout_s=30)
+        assert final["failure_type"] == "cancelled"
+        with dbmod.pool().connection() as conn:
+            assert dbmod.get_index_status(conn, settings.index_name) is None
+
+        # 放行迟到的失败收尾：终态不得被改写
+        ctl.failure_release.set()
+        for _ in range(15):
+            time.sleep(0.2)
+            st = client.get("/index/status").json()
+            assert st["status"] == "cancelled", st
+        with dbmod.pool().connection() as conn:
+            row = dbmod.get_round_by_id(conn, round_id)
+        assert row["status"] == "cancelled"
+        assert row["failure_type"] == "cancelled"
+    finally:
+        ctl.failure_release.set()
+        service.hooks.before_failure_finalize = None
+
+    # 无效残留已清理；去重后可重建，唯一索引生效
+    _dedupe()
+    client.post("/index/build")
+    poll_status(client, "complete", timeout_s=30)
+    with dbmod.pool().connection() as conn:
+        assert dbmod.index_is_valid_unique(conn, settings.index_name)
+    dup = client.post("/reports", json={"lab_no": "DUP", "report_no": "K", "measured": 9})
+    assert dup.status_code == 409
+
+
+def test_failure_first_then_late_cancel_returns_failure_reason(client):
+    """可控交错顺序二：失败先落库，取消迟到。
+
+    时序：取消请求读到 running 后被钩子挂起（在途）-> 构建失败收尾落库
+    failed(duplicate_key) 并清理无效索引 -> 放行取消 -> CAS 落空，取消拿到
+    409 与失败原因，终态保持 failed。交错期间补录与状态查询仍可用；
+    去重后可重建。
+    """
+    _insert_duplicate_keys()
+    ctl = _Interleave()
+    service.hooks.before_failure_finalize = ctl.before_failure_finalize
+    service.hooks.before_cancel_mark = ctl.before_cancel_mark
+    cancel_result: dict = {}
+    try:
+        r = client.post("/index/build")
+        assert r.status_code == 202
+        round_id = r.json()["round_id"]
+        assert ctl.failure_entered.wait(timeout=15)
+
+        # 取消请求在读到 running 后被挂起（模拟在途的迟到取消）
+        def _cancel() -> None:
+            view, code = service.request_cancel()
+            cancel_result["view"] = view
+            cancel_result["code"] = code
+
+        t = threading.Thread(target=_cancel, daemon=True)
+        t.start()
+        assert ctl.cancel_entered.wait(timeout=15)
+
+        # 交错期间：补录与状态查询仍可用
+        assert client.post("/reports", json={
+            "lab_no": "OK", "report_no": "1", "measured": 1}).status_code == 201
+        assert client.get("/index/status").status_code == 200
+
+        # 失败先落库：failed(duplicate_key)，无效索引被清理
+        ctl.failure_release.set()
+        final = poll_status(client, "failed", timeout_s=30)
+        assert final["failure_type"] == "duplicate_key"
+        with dbmod.pool().connection() as conn:
+            assert dbmod.get_index_status(conn, settings.index_name) is None
+
+        # 放行迟到的取消：应得到 409 与失败原因，终态保持 failed
+        ctl.cancel_release.set()
+        t.join(timeout=15)
+        assert not t.is_alive()
+        assert cancel_result["code"] == 409
+        view = cancel_result["view"]
+        assert str(view["round_id"]) == round_id
+        assert view["status"] == "failed"
+        assert view["failure_type"] == "duplicate_key"
+        assert view["cancel_accepted"] is False
+        assert "could not create unique index" in (view["error"] or "")
+        assert client.get("/index/status").json()["status"] == "failed"
+    finally:
+        ctl.failure_release.set()
+        ctl.cancel_release.set()
+        service.hooks.before_failure_finalize = None
+        service.hooks.before_cancel_mark = None
+
+    # HTTP 层同样返回 409 与失败原因（终态未被取消改写）
+    late = client.post("/index/cancel")
+    assert late.status_code == 409
+    body = late.json()
+    assert body["status"] == "failed"
+    assert body["failure_type"] == "duplicate_key"
+    assert body["cancel_accepted"] is False
+    assert body["error"]
+
+    # 无效残留已清理；去重后可重建，唯一索引生效
+    _dedupe()
+    client.post("/index/build")
+    poll_status(client, "complete", timeout_s=30)
+    dup = client.post("/reports", json={"lab_no": "DUP", "report_no": "K", "measured": 9})
+    assert dup.status_code == 409

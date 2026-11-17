@@ -136,8 +136,14 @@ def index_status(round_id: str | None = None):
 def cancel_build(round_id: str | None = None):
     """取消构建：先受理（cancel_requested），后端 SQL 确认停止后才转 cancelled。
 
+    * 202：已受理取消（cancel_requested），终局由后台核实后裁决；
+    * 200：索引已有效（complete）或该轮已取消（cancelled），幂等返回；
+    * 404：没有任何构建轮次；
+    * 409：该轮已 failed——取消迟到，响应体附失败原因（failure_type/error），
+      去重（sql/03_dedupe.sql）后可重新发起构建。
+
     只向记录在案的构建后端 PID 发 pg_cancel_backend，不影响补录连接；
-    若索引已有效则报 complete。
+    终态（complete/failed/cancelled）一旦确定即不可被取消或失败收尾改写。
     """
     view, code = service.request_cancel(round_id)
     return AppJSONResponse(view, status_code=code)

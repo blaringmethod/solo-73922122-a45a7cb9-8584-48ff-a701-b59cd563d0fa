@@ -40,7 +40,7 @@ docker compose up --build
 | GET | `/reports` | 分页查询报告 |
 | POST | `/index/build` | 发起/复用 `CREATE UNIQUE INDEX CONCURRENTLY`（202） |
 | GET | `/index/status` | 查询轮次状态 + `pg_index` 中索引的真实有效性 |
-| POST | `/index/cancel` | 受理取消（202 `cancel_requested`），SQL 确认停止后才 `cancelled` |
+| POST | `/index/cancel` | 受理取消（202 `cancel_requested`），SQL 确认停止后才 `cancelled`；该轮已失败时返回 `409` 与失败原因 |
 
 构建轮次状态机：
 
@@ -50,6 +50,15 @@ running ──重复键等失败──▶ failed（安全清理无效索引，re
 running ──受理取消──▶ cancel_requested ──后端 SQL 确认停止──▶ cancelled
 索引已有效时再发起/取消：直接报 complete，绝不删除有效索引
 ```
+
+**终态不可改写**：`complete` / `failed` / `cancelled` 一旦确定即为最终结论。
+所有状态迁移都是数据库层 CAS（`UPDATE ... WHERE status IN <允许的前态>`），
+取消受理与失败收尾无论怎样交错，迟到的旧操作都无法覆盖已落库的终态：
+
+- 取消先受理：watcher 核实**该轮 SQL 已停止且索引无效**才报 `cancelled`；
+  若索引已有效则报 `complete` 并保留索引。迟到的失败收尾直接丢弃。
+- 失败先落库：轮次保持 `failed` 与失败原因（`failure_type`/`error`），
+  迟到的取消收到 `409` 及失败原因；无效残留已清理，去重后可重新发起。
 
 ## 4. 关键设计如何满足需求
 
@@ -64,6 +73,10 @@ running ──受理取消──▶ cancel_requested ──后端 SQL 确认停�
   2. 仅对轮次记录在案的构建后端 PID 调用 `pg_cancel_backend`（不触碰补录连接）；
   3. watcher 轮询 `pg_stat_activity`，**确认该后端的 CREATE INDEX 真正停止**后才报
      `cancelled`；若取消未生效而索引已建成，则如实报 `complete` 并保留索引。
+- **取消 × 失败收尾交错安全**：取消登记（`running → cancel_requested`）与失败收尾
+  （`running → failed`）、取消确认（`cancel_requested → cancelled`）均为数据库层 CAS，
+  同一轮内先落库者生效；终态确定后，迟到的失败收尾/取消/对账都不会再改写，
+  删重重建的判断始终基于真实的终态与失败原因。
 - **API 重启接续，不重跑、不虚报**：启动时以系统目录为准对账——
   构建仍在跑则只挂 watcher 接续跟踪（`restarted=true`，同一 backend PID，不重发 DDL）；
   后端已停且索引无效则裁决 `failed/cancelled` 并清理；索引有效则报 `complete`。
@@ -98,12 +111,23 @@ pip install -r requirements.txt pytest httpx a2wsgi
 pytest -q
 ```
 
+11 个用例中含两个**可控交错**测试：`service.hooks`（`InterleaveHooks`）提供
+`before_failure_finalize` / `before_cancel_mark` 两个挂起点（默认 `None`，生产零开销），
+测试用 `threading.Event` 精确挂起/释放关键路径，确定性地复现并验证：
+
+- `test_cancel_first_then_late_failure_finalize_keeps_cancelled`：
+  取消先受理 → watcher 核实 SQL 停止且索引无效 → `cancelled`；迟到的失败收尾不改写终态；
+- `test_failure_first_then_late_cancel_returns_failure_reason`：
+  失败先落库 `failed(duplicate_key)` → 在途的迟到取消拿到 `409` 与失败原因，终态保持 `failed`。
+
+两个用例同时验证了交错期间补录（201）与状态查询（200）可用、无效残留被清理、去重后可重建。
+
 ## 8. 目录结构
 
 ```
 app/            FastAPI 应用（main 路由、service 构建编排、db 访问层、schemas）
 sql/            建表、补录示例、去重脚本
 demo/           四个端到端演示 + 长事务持有助手
-tests/          pytest 关键功能自测（9 个用例）
+tests/          pytest 关键功能自测（11 个用例，含两个可控交错用例）
 Dockerfile, docker-compose.yml, requirements.txt
 ```

@@ -5,6 +5,10 @@
     running ──重复键等失败───▶ failed（先安全清理无效索引，原表数据不动）
     running ──受理取消────────▶ cancel_requested ──后端确认停止──▶ cancelled
     complete 之后再取消/发起：直接报完成，不动索引。
+
+终态（complete / failed / cancelled）一旦确定即不可改写：
+所有状态迁移都是数据库层 CAS（UPDATE ... WHERE status IN <允许的前态>），
+取消受理与失败收尾无论怎样交错，迟到的旧操作都无法覆盖已确定的终态。
 """
 from __future__ import annotations
 
@@ -12,7 +16,9 @@ import logging
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Callable
 
 import psycopg
 
@@ -20,6 +26,23 @@ from . import db
 from .config import settings
 
 log = logging.getLogger("index_builder")
+
+# 终态：确定后任何旧操作（迟到的失败收尾/取消确认/对账）都不得再改写。
+TERMINAL_STATES = ("complete", "failed", "cancelled")
+
+
+@dataclass
+class InterleaveHooks:
+    """可控交错测试钩子（默认全 None，生产路径零开销）。
+
+    测试注入 callable 后，可在关键状态变更前精确挂起对应流程，
+    从而确定性地复现“取消受理 × 失败收尾”的两种交错顺序：
+      * before_failure_finalize(round_id)：构建线程失败收尾落库前触发；
+      * before_cancel_mark(round_id)：取消流程把 running 改为 cancel_requested 前触发。
+    """
+
+    before_failure_finalize: Callable[[str], None] | None = None
+    before_cancel_mark: Callable[[str], None] | None = None
 
 
 def _now() -> datetime:
@@ -48,6 +71,8 @@ class IndexBuildService:
         self._lock = threading.RLock()          # 保护 _thread/_watching
         self._thread: threading.Thread | None = None
         self._watching_round_id: str | None = None
+        # 可控交错测试钩子（仅测试注入；生产中保持默认 None，零开销）
+        self.hooks = InterleaveHooks()
 
     # --------------------------- 工具方法 -------------------------------
 
@@ -85,6 +110,7 @@ class IndexBuildService:
             conn.close()
 
     def _mark(self, round_id: str, **fields: object) -> None:
+        """非状态字段更新（backend_pid / restarted 等）。状态迁移一律走 _transition。"""
         if not fields:
             return
         fields["updated_at"] = _now()
@@ -96,6 +122,36 @@ class IndexBuildService:
                 params,
             )
             conn.commit()
+
+    def _transition(self, round_id: str, from_states: tuple[str, ...],
+                    **fields: object) -> bool:
+        """原子状态迁移（CAS）：仅当当前状态属于 from_states 才更新，返回是否生效。
+
+        终态（complete/failed/cancelled）不在任何迁移的 from_states 中，
+        因此终态一旦确定，任何迟到的旧操作（失败收尾/取消确认/启动对账）
+        都无法再改写它——交错时先落库者生效，后到者按现状如实响应。
+        """
+        fields["updated_at"] = _now()
+        assignments = ", ".join(f"{k} = %s" for k in fields)
+        placeholders = ", ".join(["%s"] * len(from_states))
+        params = list(fields.values()) + [round_id, *from_states]
+        with db.pool().connection() as conn:
+            cur = conn.execute(
+                f"UPDATE index_build_rounds SET {assignments} "
+                f"WHERE round_id = %s AND status IN ({placeholders})",
+                params,
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def _fire_hook(self, hook: Callable[[str], None] | None, round_id: str) -> None:
+        """触发可控交错钩子；钩子异常只记录，不影响主流程。"""
+        if hook is None:
+            return
+        try:
+            hook(round_id)
+        except Exception:  # noqa: BLE001 - 测试钩子不得影响生产路径
+            log.exception("interleave hook raised (round %s)", round_id)
 
     def _public_round(self, row: dict | None) -> dict | None:
         if row is None:
@@ -141,14 +197,16 @@ class IndexBuildService:
             # 语句返回后以系统目录为准判定，绝不凭“没报错”就报成功。
             with db.pool().connection() as chk:
                 if db.index_is_valid_unique(chk, index_name):
-                    self._mark(round_id, status="complete", error=None,
-                               failure_type=None)
+                    self._transition(round_id, ("running", "cancel_requested"),
+                                     status="complete", error=None, failure_type=None)
                     log.info("round %s complete", round_id)
                 else:
                     raise RuntimeError("CREATE INDEX returned but index is not valid")
         except Exception as exc:  # noqa: BLE001 - 需要全量捕获并落库
             ftype, message = _classify_error(exc)
             log.warning("round %s failed (%s): %s", round_id, ftype, message[:200])
+            # 可控交错钩子：测试可在此挂起失败收尾，复现与取消受理的交错。
+            self._fire_hook(self.hooks.before_failure_finalize, round_id)
             # 取消信号导致的 QueryCanceled（或受限环境下连接被关闭）：交给 watcher
             # 根据轮次状态裁决。为消除“SQL 先中止、cancel_requested 后落库”的竞态，
             # 在短窗口内等待取消状态登记。
@@ -165,13 +223,25 @@ class IndexBuildService:
             with db.pool().connection() as chk:
                 round_row = db.get_round_by_id(chk, round_id)
                 index_valid = db.index_is_valid_unique(chk, index_name)
-            if round_row and round_row["status"] == "cancel_requested":
-                return  # watcher 会完成 cancelled/complete 裁决与清理
+            if round_row is None:
+                return
+            if round_row["status"] == "cancel_requested":
+                return  # 取消已受理：watcher 核实后端停止后完成 cancelled/complete 裁决
+            if round_row["status"] in TERMINAL_STATES:
+                # 终态已确定（如 watcher 已裁决 cancelled/complete）：迟到的失败收尾不得改写。
+                log.info("round %s already terminal (%s); stale failure finalize skipped",
+                         round_id, round_row["status"])
+                return
             if index_valid:  # 极端竞态下索引已有效：报完成
-                self._mark(round_id, status="complete", error=None, failure_type=None)
+                self._transition(round_id, ("running", "cancel_requested"),
+                                 status="complete", error=None, failure_type=None)
                 return
             self._safe_drop_invalid_index(index_name)
-            self._mark(round_id, status="failed", failure_type=ftype, error=message)
+            # 仅从 running 迁移到 failed：若交错期间已被取消流程接管或已终局，尊重现状。
+            if not self._transition(round_id, ("running",),
+                                    status="failed", failure_type=ftype, error=message):
+                log.info("round %s: failure finalize lost CAS; existing state kept",
+                         round_id)
         finally:
             try:
                 conn.close()
@@ -201,27 +271,42 @@ class IndexBuildService:
                 round_row = db.get_round_by_id(conn, round_id)
                 if round_row is None:
                     return
-                if round_row["status"] not in ("running", "cancel_requested"):
-                    return  # 构建线程已自行终局（complete/failed）
+                status = round_row["status"]
+                if status not in ("running", "cancel_requested"):
+                    return  # 已终局：终态不再被改写
                 # 每轮以数据库中的最新 PID 为准（取消可能早于 PID 首次登记）。
                 pid = round_row["backend_pid"] or pid
                 still_running = db.backend_running_create_index(conn, pid)
                 index_valid = db.index_is_valid_unique(conn, index_name)
             if index_valid:
-                # 取消未生效或生效前索引已建成：索引有效即报完成。
-                self._mark(round_id, status="complete", error=None,
-                           failure_type=None)
-                log.info("round %s: index valid before cancel took effect -> complete",
-                         round_id)
+                # 取消未生效或生效前索引已建成：索引有效即报完成并保留，绝不删除。
+                if self._transition(round_id, ("running", "cancel_requested"),
+                                    status="complete", error=None, failure_type=None):
+                    log.info("round %s: index valid before cancel took effect -> complete",
+                             round_id)
                 return
             if not still_running:
-                # 后端确实不再跑 CREATE INDEX，且索引无效：取消成立，清理残留。
+                # 后端确实不再跑 CREATE INDEX，且索引无效：先清理残留再落终局。
                 self._safe_drop_invalid_index(index_name)
-                self._mark(round_id, status="cancelled",
-                           failure_type="cancelled",
-                           error="cancel confirmed: backend CREATE INDEX stopped; "
-                                 "invalid index cleaned up")
-                log.info("round %s cancelled and cleaned up", round_id)
+                if status == "cancel_requested":
+                    # 取消先受理 + 该轮 SQL 已确认停止 + 索引无效 -> cancelled。
+                    if self._transition(
+                        round_id, ("cancel_requested",), status="cancelled",
+                        failure_type="cancelled",
+                        error="cancel confirmed: backend CREATE INDEX stopped; "
+                              "invalid index cleaned up",
+                    ):
+                        log.info("round %s cancelled and cleaned up", round_id)
+                else:
+                    # 未受理取消而后端消失（重启接续的构建被中断）：按失败收尾。
+                    if self._transition(
+                        round_id, ("running",), status="failed",
+                        failure_type="other",
+                        error="build backend stopped before index became valid; "
+                              "invalid index cleaned up",
+                    ):
+                        log.info("round %s: backend stopped unexpectedly -> failed",
+                                 round_id)
                 return
             threading.Event().wait(settings.reconcile_interval_s)
 
@@ -256,7 +341,8 @@ class IndexBuildService:
         round_id = str(active["round_id"])
         pid = active["backend_pid"]
         if index_valid:
-            self._mark(round_id, status="complete", error=None, failure_type=None)
+            self._transition(round_id, ("running", "cancel_requested"),
+                             status="complete", error=None, failure_type=None)
             log.info("startup: round %s index is valid -> complete", round_id)
             return
 
@@ -273,21 +359,26 @@ class IndexBuildService:
             # 后端已不存在且索引无效：构建已中断。先立即落终局状态（不被长事务阻塞），
             # 再安全清理无效索引。清理带 lock_timeout 重试：无长事务时立即完成，
             # 被长事务占用时在重试窗口内等待，且绝不删除有效索引。
+            # 终局落库为 CAS：若交错期间已被取消/失败收尾确定终态，此处不再改写。
             with db.pool().connection() as conn:
                 row = db.get_round_by_id(conn, round_id)
             if row and row["status"] == "cancel_requested":
-                self._mark(round_id, status="cancelled",
-                           failure_type="cancelled",
-                           error="confirmed after API restart: backend stopped; "
-                                 "invalid index cleanup scheduled")
+                final = "cancelled"
+                self._transition(round_id, ("cancel_requested",),
+                                 status="cancelled",
+                                 failure_type="cancelled",
+                                 error="confirmed after API restart: backend stopped; "
+                                       "invalid index cleanup scheduled")
             else:
-                self._mark(round_id, status="failed",
-                           failure_type="other",
-                           error=(row.get("error") or
-                                  "build interrupted by API shutdown; invalid index cleanup scheduled"))
+                final = "failed"
+                self._transition(round_id, ("running",),
+                                 status="failed",
+                                 failure_type="other",
+                                 error=((row.get("error") if row else None) or
+                                        "build interrupted by API shutdown; "
+                                        "invalid index cleanup scheduled"))
             log.info("startup: round %s was interrupted; finalized as %s",
-                     round_id, "cancelled" if row and row["status"] == "cancel_requested"
-                     else "failed")
+                     round_id, final)
             self._safe_drop_invalid_index(settings.index_name)
 
     def _start_watcher(self, round_id: str, pid: int | None) -> None:
@@ -362,7 +453,17 @@ class IndexBuildService:
         return self._public_round(row), 202
 
     def request_cancel(self, round_id: str | None = None) -> tuple[dict, int]:
-        """受理取消：先落 cancel_requested 并返回 202，终局由 watcher 裁决。"""
+        """受理取消：先落 cancel_requested 并返回 202，终局由 watcher 裁决。
+
+        * 索引已有效：直接报 complete（200），不动索引；
+        * 轮次 running：CAS 登记 cancel_requested（202），仅向记录在案的后端 PID 发信号；
+        * 轮次已 failed：409 并附失败原因（failure_type/error），去重后可重新发起；
+        * 轮次已 complete/cancelled：200 如实返回（幂等）；
+        * 无任何轮次：404。
+
+        取消登记是数据库层 CAS（仅 running -> cancel_requested）：
+        失败先落库时，迟到的取消绝不再改写终态，只能拿到失败原因。
+        """
         with db.pool().connection() as conn:
             if db.index_is_valid_unique(conn, settings.index_name):
                 row = db.latest_round(conn)
@@ -374,31 +475,51 @@ class IndexBuildService:
             if round_id:
                 row = db.get_round_by_id(conn, round_id)
             else:
-                row = db.get_active_round(conn)
+                # 无指定轮次时优先活跃轮次；无活跃轮次则面向最近一轮，
+                # 让“失败先落库、取消迟到”也能拿到失败原因而非笼统 404。
+                row = db.get_active_round(conn) or db.latest_round(conn)
             if row is None:
                 return {"detail": "no active build round to cancel"}, 404
 
-            if row["status"] in ("complete", "failed", "cancelled"):
+            rid = str(row["round_id"])
+            if row["status"] == "failed":
+                # 失败先落库：迟到的取消返回失败原因，终态不改写。
+                view = self._public_round(row)
+                view["cancel_accepted"] = False
+                view["detail"] = ("round already failed; cancel not accepted; "
+                                  "dedupe (see sql/03_dedupe.sql) and rebuild")
+                return view, 409
+            if row["status"] in TERMINAL_STATES:  # complete / cancelled：幂等返回
                 return self._public_round(row), 200
 
-            pid = row["backend_pid"]
-            if row["status"] == "running":
-                conn.execute(
-                    "UPDATE index_build_rounds SET status = 'cancel_requested', "
-                    "updated_at = %s WHERE round_id = %s",
-                    (_now(), row["round_id"]),
-                )
-                conn.commit()
-                row = db.get_round_by_id(conn, row["round_id"])
+        # running / cancel_requested：登记取消。钩子在连接外触发，
+        # 测试可在此挂起，制造“取消在途、失败先落库”的可控交错。
+        self._fire_hook(self.hooks.before_cancel_mark, rid)
+        accepted = self._transition(rid, ("running",), status="cancel_requested")
+
+        with db.pool().connection() as conn:
+            row = db.get_round_by_id(conn, rid)
+        if row is None:
+            return {"detail": "build round disappeared"}, 404
+        if not accepted and row["status"] != "cancel_requested":
+            # CAS 落空：交错期间已被收尾（如失败先落库）。按现状如实返回，终态不改写。
+            view = self._public_round(row)
+            view["cancel_accepted"] = False
+            if row["status"] == "failed":
+                view["detail"] = ("round already failed; cancel not accepted; "
+                                  "dedupe (see sql/03_dedupe.sql) and rebuild")
+                return view, 409
+            return view, 200
 
         # 只对记录在案的构建后端发取消信号；补录连接与后续轮次的 PID 不可能等于它。
+        pid = row["backend_pid"]
         if pid:
             cancelled = self._pg_cancel_backend(pid)
             log.info("cancel signal sent to pid=%s, accepted=%s", pid, cancelled)
         # 说明：受限环境若禁止进程信号，pg_cancel_backend 会返回 false。
         # 此时可设置 BUILD_LOCK_TIMEOUT_MS，让被阻塞的构建在锁等待超时后自行中止，
         # watcher 仍依据“后端 SQL 是否真正停止”来裁决，不会误报取消。
-        self._start_watcher(str(row["round_id"]), pid)
+        self._start_watcher(rid, pid)
         view = self._public_round(row)
         view["cancel_accepted"] = True
         return view, 202

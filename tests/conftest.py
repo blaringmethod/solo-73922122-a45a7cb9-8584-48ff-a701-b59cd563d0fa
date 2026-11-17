@@ -45,10 +45,12 @@ def client(monkeypatch):
     dbmod.close_pool()
     dbmod.init_pool()
     dbmod.ensure_schema()
-    # 复位服务内线程状态。
+    # 复位服务内线程状态与可控交错钩子。
     with service._lock:
         service._thread = None
         service._watching_round_id = None
+    service.hooks.before_failure_finalize = None
+    service.hooks.before_cancel_mark = None
 
     # httpx 0.28 的 ASGITransport 仅支持异步；用 WSGI 适配在同步测试中驱动 ASGI 应用。
     c = httpx.Client(transport=httpx.WSGITransport(app=ASGIMiddleware(app)),
